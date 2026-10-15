@@ -1,0 +1,24 @@
+{
+  "format": "anova-fixture-v1",
+  "fixtures": [
+    {
+      "id": "FX-001",
+      "groups": {"A": [1, 2, 3], "B": [4, 5, 6], "C": [7, 8, 9]},
+      "expected": {"between_ss": 54, "within_ss": 6, "total_ss": 60, "between_df": 2, "within_df": 6, "total_df": 8, "between_ms": 27, "within_ms": 1, "f": 27},
+      "p_value": null,
+      "provenance": "Hand-worked arithmetic fixture. p-value deferred pending pinned external F-tail oracle."
+    },
+    {
+      "id": "FX-005",
+      "groups": {"A": [1, 1], "B": [1, 1]},
+      "expected_status": "indeterminate_zero_over_zero",
+      "provenance": "Project-defined degeneracy behavior."
+    },
+    {
+      "id": "FX-006",
+      "groups": {"A": [1, 1], "B": [2, 2]},
+      "expected_status": "infinite_f",
+      "provenance": "Project-defined limiting behavior."
+    }
+  ]
+}

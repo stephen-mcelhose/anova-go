@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# Go build artifacts
+*.exe
+*.test
+*.out
+/bin/
+/dist/
+
+# Editor
+.idea/
+.vscode/
+*.swp
