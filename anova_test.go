@@ -1,6 +1,7 @@
 package anova
 
 import (
+	"encoding/json"
 	"math"
 	"testing"
 
@@ -8,193 +9,419 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// tol is a generous absolute tolerance for hand-worked float comparisons.
-// Welford/Chan arithmetic on small integer datasets is exact to many ULPs.
+// tol is an absolute tolerance for float64 assertions.
+// Welford/Chan arithmetic on small-integer datasets is exact to many ULPs.
 const tol = 1e-10
 
-// TestOneWay covers batch ANOVA arithmetic against hand-worked reference values.
-// TST-004 / FX-001.
-func TestOneWay(t *testing.T) {
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+// obs adds values to a group, failing the test immediately on any error.
+func obs(t *testing.T, a *Accumulator, group string, vals ...float64) {
+	t.Helper()
+	for _, v := range vals {
+		require.NoError(t, a.Add(group, v))
+	}
+}
+
+// summary returns the GroupSummary for group from the current Snapshot.
+func summary(t *testing.T, a *Accumulator, group string) GroupSummary {
+	t.Helper()
+	for _, gs := range a.Snapshot().Groups {
+		if gs.Group == group {
+			return gs
+		}
+	}
+	t.Fatalf("group %q not found in snapshot", group)
+	return GroupSummary{}
+}
+
+// newAcc constructs an Accumulator or fails the test.
+func newAcc(t *testing.T, groups ...string) *Accumulator {
+	t.Helper()
+	a, err := New(groups...)
+	require.NoError(t, err)
+	return a
+}
+
+// assertMathInvariants checks the pure mathematical identities on any valid
+// Result. Extracted so it can be reused by a future FuzzMath target.
+func assertMathInvariants(t *testing.T, r Result) {
+	t.Helper()
+	if r.Status != StatusOK && r.Status != StatusNumericalWarning {
+		return
+	}
+	assert.InDelta(t, r.BetweenSS+r.WithinSS, r.TotalSS, tol,
+		"SS_T MUST equal SS_B plus SS_W")
+	assert.GreaterOrEqual(t, r.BetweenSS, 0.0,
+		"SS_B MUST be non-negative")
+	assert.GreaterOrEqual(t, r.WithinSS, 0.0,
+		"SS_W MUST be non-negative")
+	assert.InDelta(t, r.BetweenMS/r.WithinMS, r.F, tol,
+		"F MUST equal MS_B divided by MS_W")
+	assert.True(t, math.IsNaN(r.P),
+		"P MUST be NaN until the F-tail adapter is validated")
+}
+
+// ── New ──────────────────────────────────────────────────────────────────────
+
+func TestNew_Validation(t *testing.T) {
 	tests := []struct {
-		name          string
-		groups        map[string][]float64
-		wantStatus    Status
-		wantBetweenSS float64
-		wantWithinSS  float64
-		wantTotalSS   float64
-		wantBetweenMS float64
-		wantWithinMS  float64
-		wantF         float64
-		wantBetweenDF uint64
-		wantWithinDF  uint64
-		wantTotalDF   uint64
-		wantOrder     []string
+		name    string
+		groups  []string
+		wantErr error
 	}{
 		{
-			name:          "FX-001: balanced 3×3",
-			groups:        map[string][]float64{"C": {7, 8, 9}, "A": {1, 2, 3}, "B": {4, 5, 6}},
-			wantStatus:    StatusOK,
-			wantBetweenSS: 54, wantWithinSS: 6, wantTotalSS: 60,
-			wantBetweenMS: 27, wantWithinMS: 1, wantF: 27,
-			wantBetweenDF: 2, wantWithinDF: 6, wantTotalDF: 8,
+			name:    "MUST return ErrInvalidGroup when no groups are provided",
+			groups:  []string{},
+			wantErr: ErrInvalidGroup,
+		},
+		{
+			name:    "MUST return ErrInvalidGroup when any group name is the empty string",
+			groups:  []string{"A", "", "B"},
+			wantErr: ErrInvalidGroup,
+		},
+		{
+			name:    "MUST return ErrDuplicateGroup when group names are not unique",
+			groups:  []string{"A", "B", "A"},
+			wantErr: ErrDuplicateGroup,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := New(tt.groups...)
+			require.ErrorIs(t, err, tt.wantErr)
+		})
+	}
+}
+
+func TestNew_Initialization(t *testing.T) {
+	tests := []struct {
+		name      string
+		groups    []string
+		wantOrder []string
+	}{
+		{
+			name:      "MUST store groups in canonical lexicographic order regardless of input order",
+			groups:    []string{"C", "A", "B"},
 			wantOrder: []string{"A", "B", "C"},
 		},
+		{
+			name:      "MUST initialize every group with zero count, zero mean, and zero M2",
+			groups:    []string{"X", "Y"},
+			wantOrder: []string{"X", "Y"},
+		},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			r, err := OneWay(tt.groups)
+			a, err := New(tt.groups...)
 			require.NoError(t, err)
+			r := a.Snapshot()
 
-			assert.Equal(t, tt.wantStatus, r.Status)
-			assert.InDelta(t, tt.wantBetweenSS, r.BetweenSS, tol, "BetweenSS")
-			assert.InDelta(t, tt.wantWithinSS, r.WithinSS, tol, "WithinSS")
-			assert.InDelta(t, tt.wantTotalSS, r.TotalSS, tol, "TotalSS")
-			assert.InDelta(t, tt.wantBetweenMS, r.BetweenMS, tol, "BetweenMS")
-			assert.InDelta(t, tt.wantWithinMS, r.WithinMS, tol, "WithinMS")
-			assert.InDelta(t, tt.wantF, r.F, tol, "F")
-			assert.Equal(t, tt.wantBetweenDF, r.BetweenDF, "BetweenDF")
-			assert.Equal(t, tt.wantWithinDF, r.WithinDF, "WithinDF")
-			assert.Equal(t, tt.wantTotalDF, r.TotalDF, "TotalDF")
-			assert.True(t, math.IsNaN(r.P), "P must be NaN until F-tail adapter is validated")
-
-			if tt.wantOrder != nil {
-				got := make([]string, len(r.Groups))
-				for i, g := range r.Groups {
-					got[i] = g.Group
-				}
-				assert.Equal(t, tt.wantOrder, got, "canonical group order")
+			got := make([]string, len(r.Groups))
+			for i, g := range r.Groups {
+				got[i] = g.Group
+				assert.Equal(t, uint64(0), g.Count, "group %q Count", g.Group)
+				assert.Equal(t, 0.0, g.Mean, "group %q Mean", g.Group)
+				assert.Equal(t, 0.0, g.M2, "group %q M2", g.Group)
 			}
+			assert.Equal(t, tt.wantOrder, got)
 		})
 	}
 }
 
-// TestDegenerateStatuses covers inputs that cannot produce a valid F statistic.
-// TST-005 / TST-006.
-func TestDegenerateStatuses(t *testing.T) {
+// ── Add: input validation ─────────────────────────────────────────────────────
+
+func TestAdd_NonFiniteRejection(t *testing.T) {
 	tests := []struct {
-		name       string
-		groups     map[string][]float64
-		wantStatus Status
-		wantInfF   bool
+		name  string
+		value float64
 	}{
 		{
-			name:       "one empty group",
-			groups:     map[string][]float64{"A": {1, 2}, "B": {}},
-			wantStatus: StatusInsufficientGroups,
+			name:  "MUST return ErrNonFiniteValue for NaN",
+			value: math.NaN(),
 		},
 		{
-			name:       "one observation per group — no residual df",
-			groups:     map[string][]float64{"A": {1}, "B": {2}},
-			wantStatus: StatusInsufficientResidualDF,
+			name:  "MUST return ErrNonFiniteValue for positive infinity",
+			value: math.Inf(1),
 		},
 		{
-			name:       "all values identical — 0/0",
-			groups:     map[string][]float64{"A": {1, 1}, "B": {1, 1}},
-			wantStatus: StatusIndeterminateZeroOverZero,
-		},
-		{
-			name:       "zero within-group variance — infinite F",
-			groups:     map[string][]float64{"A": {1, 1}, "B": {2, 2}},
-			wantStatus: StatusInfiniteF,
-			wantInfF:   true,
+			name:  "MUST return ErrNonFiniteValue for negative infinity",
+			value: math.Inf(-1),
 		},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			r, err := OneWay(tt.groups)
-			require.NoError(t, err)
-			assert.Equal(t, tt.wantStatus, r.Status)
-			if tt.wantInfF {
-				assert.True(t, math.IsInf(r.F, 1), "expected F = +Inf, got %v", r.F)
-			}
+			a := newAcc(t, "A", "B")
+			require.ErrorIs(t, a.Add("A", tt.value), ErrNonFiniteValue)
 		})
 	}
 }
 
-// TestBatchStreamMergeEquivalence verifies that batch OneWay, streaming Add,
-// and partition Merge produce identical ANOVA tables. TST-003 / TST-011 / TST-012.
-func TestBatchStreamMergeEquivalence(t *testing.T) {
-	all := map[string][]float64{
-		"A": {1, 2, 3, 4},
-		"B": {10, 12, 11},
-		"C": {-3, -1, 0},
+func TestAdd_UnknownGroupRejection(t *testing.T) {
+	tests := []struct {
+		name  string
+		group string
+	}{
+		{
+			name:  "MUST return ErrUnknownGroup for a name absent from the registered universe",
+			group: "NOT_REGISTERED",
+		},
+		{
+			name:  "MUST return ErrUnknownGroup for a name that is a prefix of a registered group",
+			group: "A", // registry has "AB", not "A"
+		},
 	}
 
-	batch, err := OneWay(all)
-	require.NoError(t, err)
-
-	left, err := New("A", "B", "C")
-	require.NoError(t, err)
-	right, err := New("A", "B", "C")
-	require.NoError(t, err)
-
-	for _, v := range []float64{1, 3} {
-		require.NoError(t, left.Add("A", v))
+	a := newAcc(t, "AB", "CD")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.ErrorIs(t, a.Add(tt.group, 1.0), ErrUnknownGroup)
+		})
 	}
-	for _, v := range []float64{10, 11} {
-		require.NoError(t, left.Add("B", v))
-	}
-	for _, v := range []float64{-3, 0} {
-		require.NoError(t, left.Add("C", v))
-	}
-	for _, v := range []float64{2, 4} {
-		require.NoError(t, right.Add("A", v))
-	}
-	require.NoError(t, right.Add("B", 12))
-	require.NoError(t, right.Add("C", -1))
-
-	require.NoError(t, left.Merge(right))
-	stream := left.Snapshot()
-
-	assert.InDelta(t, batch.BetweenSS, stream.BetweenSS, tol, "BetweenSS")
-	assert.InDelta(t, batch.WithinSS, stream.WithinSS, tol, "WithinSS")
-	assert.InDelta(t, batch.F, stream.F, tol, "F")
-	assert.Equal(t, batch.Observations, stream.Observations, "Observations")
-	assert.Equal(t, batch.WithinDF, stream.WithinDF, "WithinDF")
 }
 
-// TestAtomicity verifies that every failing Add or Merge leaves the
-// accumulator state unchanged. TST-007 / TST-008 / TST-019 / TST-041 / TST-042.
-func TestAtomicity(t *testing.T) {
-	setup := func(t *testing.T) *Accumulator {
-		t.Helper()
-		a, err := New("A", "B")
-		require.NoError(t, err)
-		require.NoError(t, a.Add("A", 1))
-		return a
+// TestAdd_OverflowRejection covers the case where the Welford intermediate
+// overflows to a non-finite value (TST-032). The delta between two ±MaxFloat64
+// observations exceeds the representable range.
+func TestAdd_OverflowRejection(t *testing.T) {
+	tests := []struct {
+		name  string
+		seed  float64
+		value float64
+	}{
+		{
+			name:  "MUST return ErrNumericalFailure when the Welford delta overflows to negative infinity",
+			seed:  math.MaxFloat64,
+			value: -math.MaxFloat64,
+		},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := newAcc(t, "A", "B")
+			require.NoError(t, a.Add("A", tt.seed))
+			require.ErrorIs(t, a.Add("A", tt.value), ErrNumericalFailure)
+		})
+	}
+}
 
+// ── Add: Welford recurrence ───────────────────────────────────────────────────
+
+// TestAdd_WelfordRecurrence verifies that Add maintains the centered sufficient
+// statistics (Count, Mean, M2) per the Welford online algorithm. TST-001/TST-002.
+func TestAdd_WelfordRecurrence(t *testing.T) {
+	tests := []struct {
+		name     string
+		values   []float64
+		wantN    uint64
+		wantMean float64
+		wantM2   float64
+	}{
+		{
+			// First observation is the base case: n=1, mean=x, M2=0.
+			name:     "MUST set n=1, mean=x, M2=0 for the first observation",
+			values:   []float64{7},
+			wantN:    1,
+			wantMean: 7,
+			wantM2:   0,
+		},
+		{
+			// Two observations: mean=(1+3)/2=2, M2=(1-2)²+(3-2)²=2.
+			name:     "MUST update n, mean, and M2 correctly for two observations",
+			values:   []float64{1, 3},
+			wantN:    2,
+			wantMean: 2,
+			wantM2:   2,
+		},
+		{
+			// Three observations {1,2,3}: mean=2, sample var=1, M2=(n-1)*var=2.
+			name:     "MUST maintain the running M2 correctly for three observations",
+			values:   []float64{1, 2, 3},
+			wantN:    3,
+			wantMean: 2,
+			wantM2:   2,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := newAcc(t, "A", "B")
+			obs(t, a, "A", tt.values...)
+			gs := summary(t, a, "A")
+			assert.Equal(t, tt.wantN, gs.Count, "Count")
+			assert.InDelta(t, tt.wantMean, gs.Mean, tol, "Mean")
+			assert.InDelta(t, tt.wantM2, gs.M2, tol, "M2")
+		})
+	}
+}
+
+// ── Add: atomicity ────────────────────────────────────────────────────────────
+
+// TestAdd_Atomicity verifies that every rejected Add leaves the accumulator
+// state byte-for-byte identical to its pre-call state. TST-007/TST-019.
+func TestAdd_Atomicity(t *testing.T) {
 	tests := []struct {
 		name    string
 		op      func(*Accumulator) error
 		wantErr error
 	}{
 		{
-			name:    "NaN rejected",
+			name:    "MUST NOT mutate state when the value is NaN",
 			op:      func(a *Accumulator) error { return a.Add("A", math.NaN()) },
 			wantErr: ErrNonFiniteValue,
 		},
 		{
-			name:    "+Inf rejected",
+			name:    "MUST NOT mutate state when the value is positive infinity",
 			op:      func(a *Accumulator) error { return a.Add("A", math.Inf(1)) },
 			wantErr: ErrNonFiniteValue,
 		},
 		{
-			name:    "unknown group rejected",
-			op:      func(a *Accumulator) error { return a.Add("missing", 1) },
-			wantErr: ErrUnknownGroup,
+			name:    "MUST NOT mutate state when the value is negative infinity",
+			op:      func(a *Accumulator) error { return a.Add("A", math.Inf(-1)) },
+			wantErr: ErrNonFiniteValue,
 		},
 		{
-			name:    "self-merge rejected",
-			op:      func(a *Accumulator) error { return a.Merge(a) },
+			name:    "MUST NOT mutate state when the group name is not registered",
+			op:      func(a *Accumulator) error { return a.Add("MISSING", 1.0) },
+			wantErr: ErrUnknownGroup,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := newAcc(t, "A", "B")
+			obs(t, a, "A", 1.0)
+			before := a.Snapshot().Groups
+
+			require.ErrorIs(t, tt.op(a), tt.wantErr)
+
+			assert.Equal(t, before, a.Snapshot().Groups,
+				"Groups MUST be unchanged after a failed Add")
+		})
+	}
+
+	// Overflow atomicity uses a different seed so it gets its own sub-test.
+	t.Run("MUST NOT mutate state when the Welford delta overflows", func(t *testing.T) {
+		a := newAcc(t, "A", "B")
+		require.NoError(t, a.Add("A", math.MaxFloat64))
+		before := a.Snapshot().Groups
+
+		require.ErrorIs(t, a.Add("A", -math.MaxFloat64), ErrNumericalFailure)
+
+		assert.Equal(t, before, a.Snapshot().Groups,
+			"Groups MUST be unchanged after overflow")
+	})
+}
+
+// ── Merge: validation ─────────────────────────────────────────────────────────
+
+func TestMerge_Validation(t *testing.T) {
+	tests := []struct {
+		name    string
+		setup   func(t *testing.T) (a, b *Accumulator)
+		wantErr error
+	}{
+		{
+			name: "MUST return ErrSelfMerge when the receiver and argument are the same pointer",
+			setup: func(t *testing.T) (*Accumulator, *Accumulator) {
+				a := newAcc(t, "A", "B")
+				return a, a
+			},
 			wantErr: ErrSelfMerge,
 		},
 		{
-			name: "incompatible merge rejected",
-			op: func(a *Accumulator) error {
-				other, _ := New("A", "C")
+			name: "MUST return ErrIncompatible when the group counts differ",
+			setup: func(t *testing.T) (*Accumulator, *Accumulator) {
+				return newAcc(t, "A", "B"), newAcc(t, "A", "B", "C")
+			},
+			wantErr: ErrIncompatible,
+		},
+		{
+			name: "MUST return ErrIncompatible when group names differ even at equal count",
+			setup: func(t *testing.T) (*Accumulator, *Accumulator) {
+				return newAcc(t, "A", "B"), newAcc(t, "A", "C")
+			},
+			wantErr: ErrIncompatible,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a, b := tt.setup(t)
+			require.ErrorIs(t, a.Merge(b), tt.wantErr)
+		})
+	}
+}
+
+// ── Merge: Chan mechanics ─────────────────────────────────────────────────────
+
+// TestMerge_ChanMechanics verifies that Merge applies the Chan parallel
+// update formula correctly. TST-003.
+//
+// Left partition A=[1,3], B=[10,11]; right partition A=[2,4], B=[12].
+// Expected merged state per hand calculation:
+//
+//	A: n=4, mean=2.5, M2=5  ({1,2,3,4}: mean=2.5, M2=Σ(xᵢ-2.5)²=5)
+//	B: n=3, mean=11,  M2=2  ({10,11,12}: mean=11, M2=2)
+func TestMerge_ChanMechanics(t *testing.T) {
+	left := newAcc(t, "A", "B")
+	obs(t, left, "A", 1, 3)
+	obs(t, left, "B", 10, 11)
+
+	right := newAcc(t, "A", "B")
+	obs(t, right, "A", 2, 4)
+	obs(t, right, "B", 12)
+
+	require.NoError(t, left.Merge(right))
+
+	tests := []struct {
+		name     string
+		group    string
+		wantN    uint64
+		wantMean float64
+		wantM2   float64
+	}{
+		{
+			name:     "MUST merge group A to n=4, mean=2.5, M2=5",
+			group:    "A",
+			wantN:    4,
+			wantMean: 2.5,
+			wantM2:   5,
+		},
+		{
+			name:     "MUST merge group B to n=3, mean=11, M2=2",
+			group:    "B",
+			wantN:    3,
+			wantMean: 11,
+			wantM2:   2,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gs := summary(t, left, tt.group)
+			assert.Equal(t, tt.wantN, gs.Count, "Count")
+			assert.InDelta(t, tt.wantMean, gs.Mean, tol, "Mean")
+			assert.InDelta(t, tt.wantM2, gs.M2, tol, "M2")
+		})
+	}
+}
+
+// ── Merge: atomicity ──────────────────────────────────────────────────────────
+
+// TestMerge_Atomicity verifies that every rejected Merge leaves the receiver
+// state byte-for-byte identical to its pre-call state. TST-041/TST-042.
+func TestMerge_Atomicity(t *testing.T) {
+	tests := []struct {
+		name    string
+		op      func(t *testing.T, a *Accumulator) error
+		wantErr error
+	}{
+		{
+			name:    "MUST NOT mutate state when the merge target is self",
+			op:      func(_ *testing.T, a *Accumulator) error { return a.Merge(a) },
+			wantErr: ErrSelfMerge,
+		},
+		{
+			name: "MUST NOT mutate state when group schemas are incompatible",
+			op: func(t *testing.T, a *Accumulator) error {
+				other := newAcc(t, "A", "C")
 				return a.Merge(other)
 			},
 			wantErr: ErrIncompatible,
@@ -203,101 +430,737 @@ func TestAtomicity(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			a := setup(t)
-			before := a.Snapshot()
+			a := newAcc(t, "A", "B")
+			obs(t, a, "A", 1.0, 2.0)
+			before := a.Snapshot().Groups
 
-			require.ErrorIs(t, tt.op(a), tt.wantErr)
+			require.ErrorIs(t, tt.op(t, a), tt.wantErr)
 
-			after := a.Snapshot()
-			// Groups carries all mutable state; Status and Observations are derived.
-			assert.Equal(t, before.Groups, after.Groups, "Groups mutated")
-			assert.Equal(t, before.Status, after.Status, "Status changed")
-			assert.Equal(t, before.Observations, after.Observations, "Observations changed")
+			assert.Equal(t, before, a.Snapshot().Groups,
+				"Groups MUST be unchanged after a failed Merge")
 		})
 	}
 }
 
-// TestSnapshotPurity verifies Snapshot is non-mutating and returned results
-// do not alias internal accumulator state. TST-009 / TST-018.
-func TestSnapshotPurity(t *testing.T) {
-	a, err := New("B", "A")
-	require.NoError(t, err)
-	for _, v := range []float64{1, 2} {
-		require.NoError(t, a.Add("A", v))
+// ── Load ──────────────────────────────────────────────────────────────────────
+
+func TestLoad_Validation(t *testing.T) {
+	tests := []struct {
+		name    string
+		groups  []GroupSummary
+		wantErr error
+	}{
+		{
+			name:    "MUST return ErrInvalidGroup when the group list is empty",
+			groups:  []GroupSummary{},
+			wantErr: ErrInvalidGroup,
+		},
+		{
+			name:    "MUST return ErrInvalidGroup when any group name is the empty string",
+			groups:  []GroupSummary{{Group: "", Count: 0}},
+			wantErr: ErrInvalidGroup,
+		},
+		{
+			name:    "MUST return ErrDuplicateGroup when group names are not unique",
+			groups:  []GroupSummary{{Group: "A", Count: 0}, {Group: "A", Count: 1, Mean: 1}},
+			wantErr: ErrDuplicateGroup,
+		},
+		{
+			name:    "MUST return ErrCountLimit when any group count exceeds MaxExactCount",
+			groups:  []GroupSummary{{Group: "A", Count: MaxExactCount + 1}},
+			wantErr: ErrCountLimit,
+		},
+		{
+			name:    "MUST return ErrNumericalFailure when mean is NaN for a non-empty group",
+			groups:  []GroupSummary{{Group: "A", Count: 1, Mean: math.NaN(), M2: 0}},
+			wantErr: ErrNumericalFailure,
+		},
+		{
+			name:    "MUST return ErrNumericalFailure when M2 is negative",
+			groups:  []GroupSummary{{Group: "A", Count: 2, Mean: 1, M2: -1}},
+			wantErr: ErrNumericalFailure,
+		},
 	}
-	for _, v := range []float64{3, 4} {
-		require.NoError(t, a.Add("B", v))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Load(tt.groups)
+			require.ErrorIs(t, err, tt.wantErr)
+		})
 	}
-
-	one := a.Snapshot()
-	two := a.Snapshot()
-
-	assert.Equal(t, one.Status, two.Status)
-	assert.Equal(t, one.Observations, two.Observations)
-	assert.InDelta(t, one.BetweenSS, two.BetweenSS, tol)
-	assert.InDelta(t, one.WithinSS, two.WithinSS, tol)
-	assert.Equal(t, one.Groups, two.Groups)
-
-	// Mutating the returned result must not reach the accumulator.
-	one.Groups[0].Mean = 999
-	one.EmptyGroups = append(one.EmptyGroups, "injected")
-
-	three := a.Snapshot()
-	assert.NotEqual(t, 999.0, three.Groups[0].Mean, "result aliased accumulator Groups")
-	assert.Equal(t, len(two.EmptyGroups), len(three.EmptyGroups), "result aliased accumulator EmptyGroups")
 }
 
-// TestTranslationInvariance verifies that adding a large constant offset to all
-// observations does not change SS or F values. TST-013 / TST-031.
-func TestTranslationInvariance(t *testing.T) {
-	base := map[string][]float64{
-		"A": {1, 2, 3, 4, 5},
-		"B": {2, 3, 4, 5, 6},
-		"C": {-1, 0, 1, 2, 3},
-	}
-
+func TestLoad_StatePreservation(t *testing.T) {
 	tests := []struct {
 		name   string
-		offset float64
+		groups []GroupSummary
 	}{
-		{"offset +1e12", 1e12},
-		{"offset -1e12", -1e12},
+		{
+			name: "MUST preserve Count, Mean, and M2 for each loaded group",
+			groups: []GroupSummary{
+				{Group: "A", Count: 3, Mean: 2, M2: 2},
+				{Group: "B", Count: 3, Mean: 5, M2: 2},
+			},
+		},
+		{
+			name: "MUST zero Mean and M2 for groups with Count == 0",
+			groups: []GroupSummary{
+				{Group: "A", Count: 0, Mean: 999, M2: 999},
+			},
+		},
+		{
+			name: "MUST sort groups into canonical order regardless of input order",
+			groups: []GroupSummary{
+				{Group: "C", Count: 1, Mean: 7, M2: 0},
+				{Group: "A", Count: 1, Mean: 1, M2: 0},
+			},
+		},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a, err := Load(tt.groups)
+			require.NoError(t, err)
+			snap := a.Snapshot()
 
-	ref, err := OneWay(base)
+			byGroup := make(map[string]GroupSummary, len(snap.Groups))
+			for _, gs := range snap.Groups {
+				byGroup[gs.Group] = gs
+			}
+
+			for _, want := range tt.groups {
+				got, ok := byGroup[want.Group]
+				require.True(t, ok, "group %q missing from snapshot", want.Group)
+				if want.Count == 0 {
+					assert.Equal(t, uint64(0), got.Count)
+					assert.Equal(t, 0.0, got.Mean, "Mean MUST be zeroed for empty groups")
+					assert.Equal(t, 0.0, got.M2, "M2 MUST be zeroed for empty groups")
+				} else {
+					assert.Equal(t, want.Count, got.Count)
+					assert.InDelta(t, want.Mean, got.Mean, tol)
+					assert.InDelta(t, want.M2, got.M2, tol)
+				}
+			}
+		})
+	}
+}
+
+// TestLoad_MatchesAccumulatedState verifies that a loaded accumulator produces
+// the same Snapshot as one that reached the same state through sequential Add.
+func TestLoad_MatchesAccumulatedState(t *testing.T) {
+	built := newAcc(t, "A", "B", "C")
+	obs(t, built, "A", 1, 2, 3)
+	obs(t, built, "B", 4, 5, 6)
+	obs(t, built, "C", 7, 8, 9)
+	snapBuilt := built.Snapshot()
+
+	loaded, err := Load(snapBuilt.Groups)
 	require.NoError(t, err)
+	snapLoaded := loaded.Snapshot()
+
+	assert.Equal(t, snapBuilt.Status, snapLoaded.Status)
+	assert.Equal(t, snapBuilt.Groups, snapLoaded.Groups)
+	assert.InDelta(t, snapBuilt.BetweenSS, snapLoaded.BetweenSS, tol)
+	assert.InDelta(t, snapBuilt.WithinSS, snapLoaded.WithinSS, tol)
+	assert.InDelta(t, snapBuilt.F, snapLoaded.F, tol)
+}
+
+// ── MaxExactCount boundary (TST-033) ──────────────────────────────────────────
+
+// TestCountLimit uses Load to place an accumulator at the MaxExactCount
+// boundary without looping 2^53 times, then verifies the rejection and
+// success semantics of Add and Merge at that edge. TST-033.
+func TestCountLimit(t *testing.T) {
+	const half = MaxExactCount / 2
+
+	t.Run("MUST return ErrCountLimit when Add would push a group past MaxExactCount", func(t *testing.T) {
+		a, err := Load([]GroupSummary{
+			{Group: "A", Count: MaxExactCount, Mean: 0, M2: 0},
+			{Group: "B", Count: 0},
+		})
+		require.NoError(t, err)
+		before := a.Snapshot().Groups
+
+		require.ErrorIs(t, a.Add("A", 1.0), ErrCountLimit)
+
+		assert.Equal(t, before, a.Snapshot().Groups,
+			"MUST NOT mutate state when Add is rejected at MaxExactCount boundary")
+	})
+
+	t.Run("MUST return ErrCountLimit when Merge would push total count past MaxExactCount", func(t *testing.T) {
+		a, err := Load([]GroupSummary{
+			{Group: "A", Count: half + 1, Mean: 0, M2: 0},
+			{Group: "B", Count: 0},
+		})
+		require.NoError(t, err)
+
+		other, err := Load([]GroupSummary{
+			{Group: "A", Count: half, Mean: 0, M2: 0},
+			{Group: "B", Count: 0},
+		})
+		require.NoError(t, err)
+
+		before := a.Snapshot().Groups
+		require.ErrorIs(t, a.Merge(other), ErrCountLimit)
+		assert.Equal(t, before, a.Snapshot().Groups,
+			"MUST NOT mutate state when Merge is rejected at MaxExactCount boundary")
+	})
+
+	t.Run("MUST succeed when Merge brings total count to exactly MaxExactCount", func(t *testing.T) {
+		a, err := Load([]GroupSummary{
+			{Group: "A", Count: half, Mean: 0, M2: 0},
+			{Group: "B", Count: 0},
+		})
+		require.NoError(t, err)
+
+		other, err := Load([]GroupSummary{
+			{Group: "A", Count: half, Mean: 0, M2: 0},
+			{Group: "B", Count: 0},
+		})
+		require.NoError(t, err)
+
+		require.NoError(t, a.Merge(other))
+		gs := summary(t, a, "A")
+		assert.Equal(t, MaxExactCount, gs.Count,
+			"MUST accept a merge that lands exactly on MaxExactCount")
+	})
+}
+
+// ── Snapshot: status determination ───────────────────────────────────────────
+
+// TestSnapshot_Status exhausts the Status enumeration. Every code path that
+// returns a non-OK status must appear here. TST-005/TST-006.
+func TestSnapshot_Status(t *testing.T) {
+	tests := []struct {
+		name       string
+		groups     map[string][]float64
+		wantStatus Status
+		extraCheck func(t *testing.T, r Result)
+	}{
+		{
+			name:       "MUST return StatusInsufficientGroups when fewer than 2 groups have any observations",
+			groups:     map[string][]float64{"A": {1, 2}, "B": {}},
+			wantStatus: StatusInsufficientGroups,
+		},
+		{
+			name:       "MUST return StatusInsufficientGroups when only one group is registered",
+			groups:     map[string][]float64{"A": {1, 2, 3}},
+			wantStatus: StatusInsufficientGroups,
+		},
+		{
+			name:       "MUST return StatusInsufficientResidualDF when total observations do not exceed non-empty group count",
+			groups:     map[string][]float64{"A": {1}, "B": {2}},
+			wantStatus: StatusInsufficientResidualDF,
+		},
+		{
+			name:       "MUST return StatusIndeterminateZeroOverZero when within-SS and between-SS are both zero",
+			groups:     map[string][]float64{"A": {1, 1}, "B": {1, 1}},
+			wantStatus: StatusIndeterminateZeroOverZero,
+		},
+		{
+			name:       "MUST return StatusInfiniteF when within-SS is zero and between-SS is strictly positive",
+			groups:     map[string][]float64{"A": {1, 1}, "B": {2, 2}},
+			wantStatus: StatusInfiniteF,
+			extraCheck: func(t *testing.T, r Result) {
+				assert.True(t, math.IsInf(r.F, 1), "F MUST be +Inf when within-SS is zero")
+			},
+		},
+		{
+			name:       "MUST return StatusOK for a fully valid ANOVA computation",
+			groups:     map[string][]float64{"A": {1, 2, 3}, "B": {4, 5, 6}, "C": {7, 8, 9}},
+			wantStatus: StatusOK,
+		},
+	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			shifted := make(map[string][]float64, len(base))
-			for g, xs := range base {
-				s := make([]float64, len(xs))
-				for i, x := range xs {
-					s[i] = tt.offset + x
-				}
-				shifted[g] = s
-			}
-			r, err := OneWay(shifted)
+			r, err := OneWay(tt.groups)
 			require.NoError(t, err)
-			assert.InDelta(t, ref.BetweenSS, r.BetweenSS, tol, "BetweenSS")
-			assert.InDelta(t, ref.WithinSS, r.WithinSS, tol, "WithinSS")
-			assert.InDelta(t, ref.F, r.F, tol, "F")
+			assert.Equal(t, tt.wantStatus, r.Status)
+			if tt.extraCheck != nil {
+				tt.extraCheck(t, r)
+			}
 		})
 	}
 }
 
-// TestOverflowRejectedAtomically verifies that an Add whose Welford update
-// would overflow to ±Inf is rejected and leaves state unchanged. TST-032.
-func TestOverflowRejectedAtomically(t *testing.T) {
-	a, err := New("A", "B")
+// TestSnapshot_EmptyGroupTracking verifies that groups with no observations
+// are listed in EmptyGroups and excluded from the ANOVA computation.
+func TestSnapshot_EmptyGroupTracking(t *testing.T) {
+	tests := []struct {
+		name            string
+		groups          map[string][]float64
+		wantEmptyGroups []string
+		wantNonEmpty    uint64
+	}{
+		{
+			name:            "MUST list groups with zero observations in EmptyGroups",
+			groups:          map[string][]float64{"A": {1, 2}, "B": {}, "C": {3, 4}},
+			wantEmptyGroups: []string{"B"},
+			wantNonEmpty:    2,
+		},
+		{
+			name:            "MUST list all groups in EmptyGroups when none have observations",
+			groups:          map[string][]float64{"A": {}, "B": {}},
+			wantEmptyGroups: []string{"A", "B"},
+			wantNonEmpty:    0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, err := OneWay(tt.groups)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantEmptyGroups, r.EmptyGroups)
+			assert.Equal(t, tt.wantNonEmpty, r.NonEmptyGroup)
+		})
+	}
+}
+
+// ── Snapshot: arithmetic ──────────────────────────────────────────────────────
+
+// TestSnapshot_Arithmetic verifies every computed field in the ANOVA table
+// against hand-audited fixtures. TST-004.
+func TestSnapshot_Arithmetic(t *testing.T) {
+	tests := []struct {
+		name          string
+		groups        map[string][]float64
+		wantBetweenSS float64
+		wantWithinSS  float64
+		wantTotalSS   float64
+		wantBetweenDF uint64
+		wantWithinDF  uint64
+		wantTotalDF   uint64
+		wantBetweenMS float64
+		wantWithinMS  float64
+		wantF         float64
+		wantOrder     []string
+	}{
+		{
+			// FX-001: balanced 3×3. Hand-verifiable with integer arithmetic.
+			// SS_B = 3·[(1-5)²+(4-5)²+(7-5)²]·... actually:
+			// Grand mean = 5. Group means: A=2, B=5, C=8.
+			// SS_B = 3·(9+0+9) = 54. SS_W = 2·(1+1+1) = 6.
+			name:          "FX-001: MUST compute correct table for balanced 3×3 (A=[1,2,3] B=[4,5,6] C=[7,8,9])",
+			groups:        map[string][]float64{"C": {7, 8, 9}, "A": {1, 2, 3}, "B": {4, 5, 6}},
+			wantBetweenSS: 54, wantWithinSS: 6, wantTotalSS: 60,
+			wantBetweenDF: 2, wantWithinDF: 6, wantTotalDF: 8,
+			wantBetweenMS: 27, wantWithinMS: 1, wantF: 27,
+			wantOrder: []string{"A", "B", "C"},
+		},
+		{
+			// FX-002: unbalanced 3-group (n=[4,2,3]). Hand-verified.
+			// A=[1,2,3,4] mean=2.5; B=[5,6] mean=5.5; C=[7,8,9] mean=8.
+			// Grand mean=(10+11+24)/9=5.
+			// SS_B = 4(2.5-5)²+2(5.5-5)²+3(8-5)² = 25+0.5+27 = 52.5
+			// SS_W = 5 + 0.5 + 2 = 7.5
+			name:          "FX-002: MUST compute correct table for unbalanced 3-group (n=4,2,3)",
+			groups:        map[string][]float64{"A": {1, 2, 3, 4}, "B": {5, 6}, "C": {7, 8, 9}},
+			wantBetweenSS: 52.5, wantWithinSS: 7.5, wantTotalSS: 60,
+			wantBetweenDF: 2, wantWithinDF: 6, wantTotalDF: 8,
+			wantBetweenMS: 26.25, wantWithinMS: 1.25, wantF: 21,
+			wantOrder: []string{"A", "B", "C"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, err := OneWay(tt.groups)
+			require.NoError(t, err)
+			require.Equal(t, StatusOK, r.Status)
+
+			assert.InDelta(t, tt.wantBetweenSS, r.BetweenSS, tol, "BetweenSS")
+			assert.InDelta(t, tt.wantWithinSS, r.WithinSS, tol, "WithinSS")
+			assert.InDelta(t, tt.wantTotalSS, r.TotalSS, tol, "TotalSS")
+			assert.Equal(t, tt.wantBetweenDF, r.BetweenDF, "BetweenDF")
+			assert.Equal(t, tt.wantWithinDF, r.WithinDF, "WithinDF")
+			assert.Equal(t, tt.wantTotalDF, r.TotalDF, "TotalDF")
+			assert.InDelta(t, tt.wantBetweenMS, r.BetweenMS, tol, "BetweenMS")
+			assert.InDelta(t, tt.wantWithinMS, r.WithinMS, tol, "WithinMS")
+			assert.InDelta(t, tt.wantF, r.F, tol, "F")
+			assert.True(t, math.IsNaN(r.P),
+				"P MUST be NaN until the F-tail adapter is validated")
+
+			got := make([]string, len(r.Groups))
+			for i, g := range r.Groups {
+				got[i] = g.Group
+			}
+			assert.Equal(t, tt.wantOrder, got, "MUST present groups in canonical lexicographic order")
+		})
+	}
+}
+
+// ── Snapshot: purity ──────────────────────────────────────────────────────────
+
+// TestSnapshot_Purity verifies that Snapshot is non-mutating and that
+// callers cannot reach internal state through returned values. TST-009/TST-018.
+func TestSnapshot_Purity(t *testing.T) {
+	t.Run("MUST return identical results for two consecutive Snapshots without intervening Add", func(t *testing.T) {
+		a := newAcc(t, "A", "B")
+		obs(t, a, "A", 1, 2)
+		obs(t, a, "B", 3, 4)
+
+		one := a.Snapshot()
+		two := a.Snapshot()
+
+		assert.Equal(t, one.Status, two.Status)
+		assert.Equal(t, one.Observations, two.Observations)
+		assert.InDelta(t, one.BetweenSS, two.BetweenSS, tol)
+		assert.InDelta(t, one.WithinSS, two.WithinSS, tol)
+		assert.Equal(t, one.Groups, two.Groups)
+	})
+
+	t.Run("MUST NOT allow mutation of returned Groups to alter subsequent Snapshots", func(t *testing.T) {
+		a := newAcc(t, "A", "B")
+		obs(t, a, "A", 1, 2)
+		obs(t, a, "B", 3, 4)
+
+		r := a.Snapshot()
+		r.Groups[0].Mean = 999
+
+		fresh := a.Snapshot()
+		assert.NotEqual(t, 999.0, fresh.Groups[0].Mean,
+			"modifying a returned GroupSummary MUST NOT affect the accumulator")
+	})
+
+	t.Run("MUST NOT allow mutation of returned EmptyGroups to alter subsequent Snapshots", func(t *testing.T) {
+		a := newAcc(t, "A", "B", "C")
+		obs(t, a, "A", 1)
+		obs(t, a, "B", 2)
+		// C is empty
+
+		r := a.Snapshot()
+		before := len(r.EmptyGroups)
+		r.EmptyGroups = append(r.EmptyGroups, "injected")
+
+		fresh := a.Snapshot()
+		assert.Equal(t, before, len(fresh.EmptyGroups),
+			"appending to a returned EmptyGroups MUST NOT affect the accumulator")
+	})
+}
+
+// ── Math: pure invariants (fuzz-ready) ───────────────────────────────────────
+//
+// Each test calls assertMathInvariants, which can be lifted directly into a
+// FuzzMath target once fixtures are generated externally.
+
+var mathFixtures = []struct {
+	name   string
+	groups map[string][]float64
+}{
+	{
+		name:   "FX-001: balanced 3×3",
+		groups: map[string][]float64{"A": {1, 2, 3}, "B": {4, 5, 6}, "C": {7, 8, 9}},
+	},
+	{
+		name:   "FX-002: unbalanced 3-group",
+		groups: map[string][]float64{"A": {1, 2, 3, 4}, "B": {5, 6}, "C": {7, 8, 9}},
+	},
+	{
+		name:   "two groups, many observations",
+		groups: map[string][]float64{"A": {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, "B": {11, 12, 13, 14, 15}},
+	},
+	{
+		name:   "groups with negative values",
+		groups: map[string][]float64{"A": {-3, -1, 1}, "B": {-2, 0, 2}, "C": {0, 2, 4}},
+	},
+}
+
+// TestMath_Decomposition verifies SS_T = SS_B + SS_W for every fixture.
+func TestMath_Decomposition(t *testing.T) {
+	for _, fx := range mathFixtures {
+		t.Run("SS_T MUST equal SS_B plus SS_W: "+fx.name, func(t *testing.T) {
+			r, err := OneWay(fx.groups)
+			require.NoError(t, err)
+			assertMathInvariants(t, r)
+		})
+	}
+}
+
+// TestMath_NonNegativity verifies SS_B ≥ 0 and SS_W ≥ 0 for every fixture.
+func TestMath_NonNegativity(t *testing.T) {
+	for _, fx := range mathFixtures {
+		t.Run("SS_B and SS_W MUST be non-negative: "+fx.name, func(t *testing.T) {
+			r, err := OneWay(fx.groups)
+			require.NoError(t, err)
+			assertMathInvariants(t, r)
+		})
+	}
+}
+
+// TestMath_FIdentity verifies F = MS_B / MS_W for every fixture.
+func TestMath_FIdentity(t *testing.T) {
+	for _, fx := range mathFixtures {
+		t.Run("F MUST equal MS_B divided by MS_W: "+fx.name, func(t *testing.T) {
+			r, err := OneWay(fx.groups)
+			require.NoError(t, err)
+			assertMathInvariants(t, r)
+		})
+	}
+}
+
+// TestMath_TranslationInvariance verifies that adding a finite constant to
+// every observation leaves SS values and F unchanged. TST-013/TST-031.
+func TestMath_TranslationInvariance(t *testing.T) {
+	offsets := []struct {
+		name   string
+		offset float64
+	}{
+		{"offset +1e12", +1e12},
+		{"offset -1e12", -1e12},
+		{"offset +1e6", +1e6},
+	}
+
+	for _, fx := range mathFixtures {
+		for _, off := range offsets {
+			name := fx.name + " — " + off.name
+			t.Run("SS and F MUST be invariant under translation: "+name, func(t *testing.T) {
+				ref, err := OneWay(fx.groups)
+				require.NoError(t, err)
+
+				shifted := make(map[string][]float64, len(fx.groups))
+				for g, xs := range fx.groups {
+					s := make([]float64, len(xs))
+					for i, x := range xs {
+						s[i] = off.offset + x
+					}
+					shifted[g] = s
+				}
+				r, err := OneWay(shifted)
+				require.NoError(t, err)
+
+				assert.InDelta(t, ref.BetweenSS, r.BetweenSS, tol, "BetweenSS")
+				assert.InDelta(t, ref.WithinSS, r.WithinSS, tol, "WithinSS")
+				assert.InDelta(t, ref.F, r.F, tol, "F")
+			})
+		}
+	}
+}
+
+// TestMath_BatchStreamEquivalence verifies that sequential Add and batch
+// OneWay produce identical ANOVA tables. TST-012.
+func TestMath_BatchStreamEquivalence(t *testing.T) {
+	for _, fx := range mathFixtures {
+		t.Run("batch and sequential Add MUST produce equivalent results: "+fx.name, func(t *testing.T) {
+			batch, err := OneWay(fx.groups)
+			require.NoError(t, err)
+
+			labels := make([]string, 0, len(fx.groups))
+			for g := range fx.groups {
+				labels = append(labels, g)
+			}
+			stream := newAcc(t, labels...)
+			for g, xs := range fx.groups {
+				obs(t, stream, g, xs...)
+			}
+			snap := stream.Snapshot()
+
+			assert.Equal(t, batch.Status, snap.Status)
+			assert.InDelta(t, batch.BetweenSS, snap.BetweenSS, tol, "BetweenSS")
+			assert.InDelta(t, batch.WithinSS, snap.WithinSS, tol, "WithinSS")
+			assert.InDelta(t, batch.F, snap.F, tol, "F")
+			assert.Equal(t, batch.Observations, snap.Observations)
+		})
+	}
+}
+
+// TestMath_PartitionEquivalence verifies that merging two disjoint partitions
+// produces the same result as adding all observations in sequence. TST-003/TST-011.
+func TestMath_PartitionEquivalence(t *testing.T) {
+	for _, fx := range mathFixtures {
+		t.Run("partition Merge MUST produce results equivalent to sequential Add: "+fx.name, func(t *testing.T) {
+			ref, err := OneWay(fx.groups)
+			require.NoError(t, err)
+
+			labels := make([]string, 0, len(fx.groups))
+			for g := range fx.groups {
+				labels = append(labels, g)
+			}
+
+			left := newAcc(t, labels...)
+			right := newAcc(t, labels...)
+
+			// Split each group: even indices → left, odd → right.
+			for g, xs := range fx.groups {
+				for i, x := range xs {
+					if i%2 == 0 {
+						require.NoError(t, left.Add(g, x))
+					} else {
+						require.NoError(t, right.Add(g, x))
+					}
+				}
+			}
+			require.NoError(t, left.Merge(right))
+			merged := left.Snapshot()
+
+			assert.Equal(t, ref.Status, merged.Status)
+			assert.InDelta(t, ref.BetweenSS, merged.BetweenSS, tol, "BetweenSS")
+			assert.InDelta(t, ref.WithinSS, merged.WithinSS, tol, "WithinSS")
+			assert.InDelta(t, ref.F, merged.F, tol, "F")
+			assert.Equal(t, ref.Observations, merged.Observations)
+		})
+	}
+}
+
+// ── JSON serialization ────────────────────────────────────────────────────────
+
+// TestJSON_GroupSummary verifies the wire format of GroupSummary.
+// GroupSummary is the only state that must survive serialization; everything
+// else in Result is derived and can be recomputed.
+func TestJSON_GroupSummary(t *testing.T) {
+	tests := []struct {
+		name     string
+		gs       GroupSummary
+		wantJSON string
+	}{
+		{
+			name:     "MUST serialize with keys group, count, mean, m2",
+			gs:       GroupSummary{Group: "control", Count: 3, Mean: 2.0, M2: 2.0},
+			wantJSON: `{"group":"control","count":3,"mean":2,"m2":2}`,
+		},
+		{
+			name:     "MUST round-trip a group with zero count and zero moments",
+			gs:       GroupSummary{Group: "empty", Count: 0, Mean: 0, M2: 0},
+			wantJSON: `{"group":"empty","count":0,"mean":0,"m2":0}`,
+		},
+		{
+			name:     "MUST round-trip a group with a negative mean",
+			gs:       GroupSummary{Group: "neg", Count: 2, Mean: -1.5, M2: 0.5},
+			wantJSON: `{"group":"neg","count":2,"mean":-1.5,"m2":0.5}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b, err := json.Marshal(tt.gs)
+			require.NoError(t, err)
+			assert.JSONEq(t, tt.wantJSON, string(b))
+
+			var got GroupSummary
+			require.NoError(t, json.Unmarshal(b, &got))
+			assert.Equal(t, tt.gs, got)
+		})
+	}
+}
+
+// TestJSON_Status verifies that Status marshals as its string name, not its
+// numeric value, and that every defined value round-trips cleanly.
+func TestJSON_Status(t *testing.T) {
+	tests := []struct {
+		name     string
+		status   Status
+		wantJSON string
+	}{
+		{
+			name:     `MUST serialize StatusOK as "ok"`,
+			status:   StatusOK,
+			wantJSON: `"ok"`,
+		},
+		{
+			name:     `MUST serialize StatusInsufficientGroups as "insufficient_groups"`,
+			status:   StatusInsufficientGroups,
+			wantJSON: `"insufficient_groups"`,
+		},
+		{
+			name:     `MUST serialize StatusInsufficientResidualDF as "insufficient_residual_df"`,
+			status:   StatusInsufficientResidualDF,
+			wantJSON: `"insufficient_residual_df"`,
+		},
+		{
+			name:     `MUST serialize StatusIndeterminateZeroOverZero as "indeterminate_zero_over_zero"`,
+			status:   StatusIndeterminateZeroOverZero,
+			wantJSON: `"indeterminate_zero_over_zero"`,
+		},
+		{
+			name:     `MUST serialize StatusInfiniteF as "infinite_f"`,
+			status:   StatusInfiniteF,
+			wantJSON: `"infinite_f"`,
+		},
+		{
+			name:     `MUST serialize StatusNumericalWarning as "numerical_warning"`,
+			status:   StatusNumericalWarning,
+			wantJSON: `"numerical_warning"`,
+		},
+		{
+			name:     `MUST serialize StatusNumericalFailure as "numerical_failure"`,
+			status:   StatusNumericalFailure,
+			wantJSON: `"numerical_failure"`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b, err := json.Marshal(tt.status)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantJSON, string(b))
+
+			var got Status
+			require.NoError(t, json.Unmarshal(b, &got))
+			assert.Equal(t, tt.status, got)
+		})
+	}
+
+	t.Run("MUST return an error when unmarshaling an unrecognized status string", func(t *testing.T) {
+		var s Status
+		require.Error(t, json.Unmarshal([]byte(`"bogus"`), &s))
+	})
+}
+
+// TestJSON_Groups_RoundTrip is the canonical demonstration of how to persist
+// and restore accumulator state. Only Groups needs to be serialized; all ANOVA
+// table fields are derived and need not be stored.
+//
+// Serialized shape for FX-001 (A=[1,2,3], B=[4,5,6], C=[7,8,9]):
+//
+//	[
+//	  {"group":"A","count":3,"mean":2,"m2":2},
+//	  {"group":"B","count":3,"mean":5,"m2":2},
+//	  {"group":"C","count":3,"mean":8,"m2":2}
+//	]
+func TestJSON_Groups_RoundTrip(t *testing.T) {
+	a := newAcc(t, "A", "B", "C")
+	obs(t, a, "A", 1, 2, 3)
+	obs(t, a, "B", 4, 5, 6)
+	obs(t, a, "C", 7, 8, 9)
+	snap := a.Snapshot()
+
+	b, err := json.Marshal(snap.Groups)
 	require.NoError(t, err)
-	require.NoError(t, a.Add("A", math.MaxFloat64))
 
-	before := a.Snapshot()
+	wantJSON := `[
+		{"group":"A","count":3,"mean":2,"m2":2},
+		{"group":"B","count":3,"mean":5,"m2":2},
+		{"group":"C","count":3,"mean":8,"m2":2}
+	]`
+	assert.JSONEq(t, wantJSON, string(b))
 
-	// Second MaxFloat64 with opposite sign: delta = -2·MaxFloat64 → -Inf.
-	require.ErrorIs(t, a.Add("A", -math.MaxFloat64), ErrNumericalFailure)
+	var loaded []GroupSummary
+	require.NoError(t, json.Unmarshal(b, &loaded))
+	assert.Equal(t, snap.Groups, loaded,
+		"deserialized Groups MUST be identical to the originals")
+}
 
-	after := a.Snapshot()
-	assert.Equal(t, before.Groups, after.Groups, "accumulator mutated by overflowing Add")
+// TestJSON_Result_NaNInfLimitation documents that json.Marshal cannot encode
+// a Result directly because P is always NaN and F is +Inf for StatusInfiniteF.
+// encoding/json rejects non-finite float64 values per the JSON spec.
+//
+// To persist results, serialize Groups only (see TestJSON_Groups_RoundTrip).
+// To share the full table, callers must sanitize NaN/Inf fields themselves.
+func TestJSON_Result_NaNInfLimitation(t *testing.T) {
+	t.Run("MUST fail to marshal a Result because P is always NaN", func(t *testing.T) {
+		r, err := OneWay(map[string][]float64{"A": {1, 2, 3}, "B": {4, 5, 6}})
+		require.NoError(t, err)
+		require.Equal(t, StatusOK, r.Status)
+		assert.True(t, math.IsNaN(r.P), "P is always NaN until F-tail adapter is validated")
+
+		_, marshalErr := json.Marshal(r)
+		require.Error(t, marshalErr,
+			"json.Marshal MUST return an error when P is NaN; marshal Groups instead")
+	})
+
+	t.Run("MUST fail to marshal a StatusInfiniteF Result because F is +Inf", func(t *testing.T) {
+		r, err := OneWay(map[string][]float64{"A": {1, 1}, "B": {2, 2}})
+		require.NoError(t, err)
+		require.Equal(t, StatusInfiniteF, r.Status)
+		assert.True(t, math.IsInf(r.F, 1), "F is +Inf when within-SS is zero")
+
+		_, marshalErr := json.Marshal(r)
+		require.Error(t, marshalErr,
+			"json.Marshal MUST return an error when F is +Inf; marshal Groups instead")
+	})
 }
