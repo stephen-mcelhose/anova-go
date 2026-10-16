@@ -5,9 +5,12 @@
 // statistics (count, mean, M2) using Welford updates and Chan-style merges.
 //
 // The package deliberately does not implement Welch, factorial, repeated-
-// measures, post-hoc, sliding-window, or sequential-valid ANOVA. Snapshot
-// p-values are intentionally unavailable until a version-pinned F-distribution
-// adapter is validated against independent R and SciPy reference fixtures.
+// measures, post-hoc, sliding-window, or sequential-valid ANOVA.
+//
+// P-values for StatusOK snapshots are computed via the F-distribution survival
+// function provided by gonum.org/v1/gonum/stat/distuv (v0.17.0), validated
+// against independent R 4.5.0 reference fixtures (see references/oracles/).
+// P is NaN for all non-OK statuses.
 package anova
 
 import (
@@ -15,6 +18,8 @@ import (
 	"fmt"
 	"math"
 	"sort"
+
+	"github.com/stephen-mcelhose/anova-go/internal/ftail"
 )
 
 // MaxExactCount is the largest integer exactly representable by float64.
@@ -363,6 +368,7 @@ func (a *Accumulator) Snapshot() Result {
 		result.Status = StatusNumericalWarning
 	} else {
 		result.Status = StatusOK
+		result.P = ftail.PValue(result.F, result.BetweenDF, result.WithinDF)
 	}
 	return result
 }

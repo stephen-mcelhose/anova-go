@@ -58,8 +58,16 @@ func assertMathInvariants(t *testing.T, r Result) {
 		"SS_W MUST be non-negative")
 	assert.InDelta(t, r.BetweenMS/r.WithinMS, r.F, tol,
 		"F MUST equal MS_B divided by MS_W")
-	assert.True(t, math.IsNaN(r.P),
-		"P MUST be NaN until the F-tail adapter is validated")
+	// StatusOK results carry a real p-value from the F-tail adapter.
+	// StatusNumericalWarning results retain NaN because the adapter is not
+	// invoked when SS clamping has occurred.
+	if r.Status == StatusOK {
+		assert.True(t, r.P >= 0 && r.P <= 1,
+			"P MUST be in [0,1] for StatusOK")
+	} else {
+		assert.True(t, math.IsNaN(r.P),
+			"P MUST be NaN for non-OK status")
+	}
 }
 
 // ── New ──────────────────────────────────────────────────────────────────────
@@ -775,8 +783,8 @@ func TestSnapshot_Arithmetic(t *testing.T) {
 			assert.InDelta(t, tt.wantBetweenMS, r.BetweenMS, tol, "BetweenMS")
 			assert.InDelta(t, tt.wantWithinMS, r.WithinMS, tol, "WithinMS")
 			assert.InDelta(t, tt.wantF, r.F, tol, "F")
-			assert.True(t, math.IsNaN(r.P),
-				"P MUST be NaN until the F-tail adapter is validated")
+			assert.True(t, r.P >= 0 && r.P <= 1,
+				"P MUST be in [0,1] for StatusOK")
 
 			got := make([]string, len(r.Groups))
 			for i, g := range r.Groups {
@@ -1135,22 +1143,21 @@ func TestJSON_Groups_RoundTrip(t *testing.T) {
 		"deserialized Groups MUST be identical to the originals")
 }
 
-// TestJSON_Result_NaNInfLimitation documents that json.Marshal cannot encode
-// a Result directly because P is always NaN and F is +Inf for StatusInfiniteF.
-// encoding/json rejects non-finite float64 values per the JSON spec.
+// TestJSON_Result_NaNInfLimitation documents json.Marshal behavior for Result.
+// StatusOK results now have a finite P value and marshal successfully.
+// StatusInfiniteF results still fail to marshal because F is +Inf.
 //
-// To persist results, serialize Groups only (see TestJSON_Groups_RoundTrip).
-// To share the full table, callers must sanitize NaN/Inf fields themselves.
+// To persist accumulator state, serialize Groups only (see TestJSON_Groups_RoundTrip).
 func TestJSON_Result_NaNInfLimitation(t *testing.T) {
-	t.Run("MUST fail to marshal a Result because P is always NaN", func(t *testing.T) {
+	t.Run("MUST marshal a StatusOK Result now that P is a finite value", func(t *testing.T) {
 		r, err := OneWay(map[string][]float64{"A": {1, 2, 3}, "B": {4, 5, 6}})
 		require.NoError(t, err)
 		require.Equal(t, StatusOK, r.Status)
-		assert.True(t, math.IsNaN(r.P), "P is always NaN until F-tail adapter is validated")
+		assert.True(t, r.P >= 0 && r.P <= 1, "P MUST be in [0,1] for StatusOK")
 
 		_, marshalErr := json.Marshal(r)
-		require.Error(t, marshalErr,
-			"json.Marshal MUST return an error when P is NaN; marshal Groups instead")
+		require.NoError(t, marshalErr,
+			"json.Marshal MUST succeed for a StatusOK Result with finite P")
 	})
 
 	t.Run("MUST fail to marshal a StatusInfiniteF Result because F is +Inf", func(t *testing.T) {
