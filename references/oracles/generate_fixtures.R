@@ -115,19 +115,37 @@ add("TST-030 alpha=0.01 critical df=2,6 F=10.925", 2, 6, 10.925)
 add("TST-030 alpha=0.05 critical df=5,20 F=2.711", 5, 20, 2.711)
 
 # ── Write CSV ─────────────────────────────────────────────────────────────────
+#
+# write.csv() uses R's default format() which does NOT honour options(digits)
+# reliably and may emit shortened representations (e.g. "0.001" instead of
+# "0.0010000000000000007") that lose precision when parsed back as float64.
+#
+# We write the CSV manually with sprintf("%.17g", ...) for every floating-
+# point field. 17 significant decimal digits are sufficient to uniquely
+# identify any IEEE 754 double: parse(format(x, digits=17)) == x exactly.
 
 df_out <- do.call(rbind, lapply(rows, as.data.frame, stringsAsFactors = FALSE))
-
-# Emit p_value at full double precision (17 significant digits) so that
-# the Go oracle test can verify within 1e-9 absolute tolerance without
-# loss from decimal truncation.
-options(digits = 17)
 
 # Print R session info for provenance
 cat("# R session info:\n")
 cat(paste0("# ", capture.output(sessionInfo()), collapse = "\n"), "\n")
 cat(sprintf("# Rows: %d\n", nrow(df_out)))
-cat("# Columns: description,df_between,df_within,f_stat,p_value\n")
 
-write.csv(df_out, file = "f_tail_fixtures.csv", row.names = FALSE)
+con <- file("f_tail_fixtures.csv", open = "w")
+
+# Header — column names contain no commas or quotes, no quoting needed.
+writeLines("description,df_between,df_within,f_stat,p_value", con)
+
+for (i in seq_len(nrow(df_out))) {
+  # description may contain commas (e.g. "A=[1,2,3]") — always double-quote it.
+  line <- sprintf('"%s",%d,%d,%.17g,%.17g',
+    df_out$description[i],
+    df_out$df_between[i],
+    df_out$df_within[i],
+    df_out$f_stat[i],
+    df_out$p_value[i])
+  writeLines(line, con)
+}
+
+close(con)
 cat("Written: f_tail_fixtures.csv\n")
