@@ -106,7 +106,7 @@ func TestOracle_AnovaTable(t *testing.T) {
 	}
 }
 
-// TestOracle_FTail [TST-034] is the differential tail-test gate required by
+// TestOracle_FTail [TST-026–030] is the differential tail-test gate required by
 // ADR-005. It reads references/oracles/f_tail_fixtures.csv, produced by
 // references/oracles/generate_fixtures.R using R 4.5.0 pf(), and asserts that
 // the anova package's F-tail adapter (gonum distuv.F.Survival) matches every

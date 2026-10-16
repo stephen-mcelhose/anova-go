@@ -44,6 +44,13 @@
 **Rationale:** Returning fabricated 0/NaN p-values silently corrupts downstream interpretation.  
 **Consequences:** API consumers must check status/validity before using p-values.
 
+## ADR-008 — v1 concurrency policy: caller-owned synchronization, no library wrapper
+
+**Status:** Accepted  
+**Decision:** `Accumulator` is not concurrency-safe. v1 documents caller-owned synchronization as the required policy and ships no synchronized wrapper type.  
+**Rationale:** The intended streaming pipeline routes each observation to a single owning goroutine (`source | filter | route-to-owner | Add | sink`). Routing is the synchronization: no two goroutines ever write to the same `Accumulator`, so a library mutex adds overhead without solving a real problem. For callers with a different topology who need shared access, wrapping with `sync.Mutex` is ~5 lines and is not a library concern. Adding a `SyncAccumulator` type would introduce non-trivial lock-ordering logic in `Merge` (ABBA deadlock risk) and a permanent maintenance surface with no benefit for the primary use case.  
+**Consequences:** The GoDoc and package examples must state the caller-sync contract explicitly. An `ExampleAccumulator_callerSync` example demonstrates the `sync.Mutex` pattern for callers who need it. A synchronized wrapper may be revisited in a future ADR if evidence of widespread need emerges.
+
 ## ADR-007 — R is the trusted oracle for pinned ANOVA table fixtures; revisit for fuzz
 
 **Status:** Accepted  

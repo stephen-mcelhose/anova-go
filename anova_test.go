@@ -2,7 +2,10 @@ package anova
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
+	"math/rand"
+	"sort"
 	"strconv"
 	"testing"
 
@@ -1244,6 +1247,72 @@ func TestStress_DeterministicOrder(t *testing.T) {
 	assert.InDelta(t, r1.F, r2.F, tol, "F must be order-independent")
 	assert.Equal(t, r1.BetweenDF, r2.BetweenDF, "BetweenDF must be order-independent")
 	assert.Equal(t, r1.WithinDF, r2.WithinDF, "WithinDF must be order-independent")
+}
+
+// ── Randomized merge-tree order (TST-034) ────────────────────────────────────
+
+// TestMath_RandomMergeTreeOrder [TST-034] verifies that merging N disjoint
+// shards in a randomly-permuted order gives results equivalent to a single
+// sequential accumulator within the documented floating-point tolerance.
+//
+// The existing TST-011 (TestMath_PartitionEquivalence) and TST-039
+// (TestStress_HugeScale) exercise fixed 2-way even/odd splits. This test
+// adds N-ary trees (N ∈ {2, 3, 5, 8}) with randomly-permuted merge order,
+// exposing floating-point non-commutativity across deeper merge trees.
+//
+// A fixed seed (42) keeps the test deterministic and CI-stable.
+func TestMath_RandomMergeTreeOrder(t *testing.T) {
+	rng := rand.New(rand.NewSource(42))
+
+	shardCounts := []int{2, 3, 5, 8}
+
+	for _, fx := range mathFixtures {
+		for _, n := range shardCounts {
+			n := n
+			name := fmt.Sprintf("%s — %d shards", fx.name, n)
+			t.Run(name, func(t *testing.T) {
+				// Reference: single accumulator fed all observations.
+				labels := make([]string, 0, len(fx.groups))
+				for g := range fx.groups {
+					labels = append(labels, g)
+				}
+				sort.Strings(labels)
+
+				ref := newAcc(t, labels...)
+				for _, g := range labels {
+					obs(t, ref, g, fx.groups[g]...)
+				}
+				want := ref.Snapshot()
+				if want.Status != StatusOK && want.Status != StatusNumericalWarning {
+					t.Skipf("fixture %q produces non-OK status %v; skipping merge-tree check", fx.name, want.Status)
+				}
+
+				// Build n shards: observation i goes to shard i%n.
+				shards := make([]*Accumulator, n)
+				for i := range shards {
+					shards[i] = newAcc(t, labels...)
+				}
+				for _, g := range labels {
+					for i, x := range fx.groups[g] {
+						require.NoError(t, shards[i%n].Add(g, x))
+					}
+				}
+
+				// Merge shards in a random permutation into shards[0].
+				perm := rng.Perm(n)
+				base := shards[perm[0]]
+				for _, idx := range perm[1:] {
+					require.NoError(t, base.Merge(shards[idx]))
+				}
+				got := base.Snapshot()
+
+				assertWithinTol(t, want.BetweenSS, got.BetweenSS, stressAbsTol, stressRelTol, "BetweenSS")
+				assertWithinTol(t, want.WithinSS, got.WithinSS, stressAbsTol, stressRelTol, "WithinSS")
+				assertWithinTol(t, want.F, got.F, stressAbsTol, stressRelTol, "F")
+				assert.Equal(t, want.Observations, got.Observations, "observation count must be exact")
+			})
+		}
+	}
 }
 
 // ── JSON serialization ────────────────────────────────────────────────────────
