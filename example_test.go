@@ -16,6 +16,7 @@ package anova_test
 import (
 	"fmt"
 	"log"
+	"sync"
 
 	anova "github.com/stephen-mcelhose/anova-go"
 )
@@ -100,6 +101,119 @@ func ExampleAccumulator() {
 	fmt.Printf("SS_B=%.1f  SS_W=%.1f  F=%.1f\n", r.BetweenSS, r.WithinSS, r.F)
 	// Output:
 	// SS_B=54.0  SS_W=6.0  F=27.0
+}
+
+// ExampleAccumulator_pipeline shows the recommended streaming topology: one
+// goroutine owns each Accumulator and receives observations via a channel.
+// Routing is the synchronization — no mutex is needed because no two goroutines
+// share a single Accumulator. See ADR-008 for the concurrency policy rationale.
+func ExampleAccumulator_pipeline() {
+	type observation struct {
+		group string
+		value float64
+	}
+
+	// One channel per group; each goroutine owns exactly one Accumulator.
+	// Both accumulators must share the same group universe to be mergeable.
+	chA := make(chan float64, 10)
+	chB := make(chan float64, 10)
+
+	accA, err := anova.New("A", "B")
+	if err != nil {
+		log.Fatal(err)
+	}
+	accB, err := anova.New("A", "B")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for v := range chA {
+			if err := accA.Add("A", v); err != nil {
+				log.Fatal(err)
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for v := range chB {
+			if err := accB.Add("B", v); err != nil {
+				log.Fatal(err)
+			}
+		}
+	}()
+
+	// Router: send each observation to its owning channel.
+	observations := []observation{
+		{"A", 1}, {"B", 4}, {"A", 2}, {"B", 5}, {"A", 3}, {"B", 6},
+	}
+	for _, o := range observations {
+		switch o.group {
+		case "A":
+			chA <- o.value
+		case "B":
+			chB <- o.value
+		}
+	}
+	close(chA)
+	close(chB)
+	wg.Wait()
+
+	// Merge the two independently-built accumulators.
+	if err := accA.Merge(accB); err != nil {
+		log.Fatal(err)
+	}
+	r := accA.Snapshot()
+	if !r.Valid() {
+		log.Fatalf("invalid result: %v", r.Status)
+	}
+	fmt.Printf("observations=%d  groups=%d\n", r.Observations, r.NonEmptyGroup)
+	// Output:
+	// observations=6  groups=2
+}
+
+// ExampleAccumulator_callerSync shows how to share a single Accumulator across
+// goroutines when the routed-pipeline topology is not available. Callers provide
+// their own sync.Mutex; the library does not supply a synchronized wrapper
+// (see ADR-008).
+func ExampleAccumulator_callerSync() {
+	a, err := anova.New("A", "B")
+	if err != nil {
+		log.Fatal(err)
+	}
+	var mu sync.Mutex
+
+	safeAdd := func(group string, value float64) error {
+		mu.Lock()
+		defer mu.Unlock()
+		return a.Add(group, value)
+	}
+	safeSnapshot := func() anova.Result {
+		mu.Lock()
+		defer mu.Unlock()
+		return a.Snapshot()
+	}
+
+	var wg sync.WaitGroup
+	for _, v := range []float64{1, 2, 3} {
+		v := v
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := safeAdd("A", v); err != nil {
+				log.Fatal(err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	r := safeSnapshot()
+	fmt.Printf("observations=%d\n", r.Observations)
+	// Output:
+	// observations=3
 }
 
 // ExampleAccumulator_merge shows how two independently-built Accumulators over
