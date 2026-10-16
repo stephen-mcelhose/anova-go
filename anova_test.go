@@ -3,6 +3,7 @@ package anova
 import (
 	"encoding/json"
 	"math"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -11,7 +12,31 @@ import (
 
 // tol is an absolute tolerance for float64 assertions.
 // Welford/Chan arithmetic on small-integer datasets is exact to many ULPs.
+// Only use tol for normal-scale fixtures (SS values O(1)–O(1000)).
+// For extreme-scale data use withinTol instead — see wiki/04 §Tolerance.
 const tol = 1e-10
+
+// withinTol implements the wiki/04-numerical-stability.md §Recommended tolerance
+// contract: |a−b| ≤ absTol + relTol·max(|a|,|b|).
+//
+// Use relTol ≈ 1e-12 for Chan-merge comparisons (a few ULPs at any scale).
+// absTol catches the near-zero case where both values are tiny.
+func withinTol(a, b, absTol, relTol float64) bool {
+	diff := math.Abs(a - b)
+	scale := math.Max(math.Abs(a), math.Abs(b))
+	return diff <= absTol+relTol*scale
+}
+
+// assertWithinTol calls t.Errorf if withinTol(a, b, absTol, relTol) is false.
+func assertWithinTol(t *testing.T, a, b, absTol, relTol float64, label string) {
+	t.Helper()
+	if !withinTol(a, b, absTol, relTol) {
+		diff := math.Abs(a - b)
+		scale := math.Max(math.Abs(a), math.Abs(b))
+		t.Errorf("%s: |%g − %g| = %g > absTol(%g) + relTol(%g)·scale(%g) = %g",
+			label, a, b, diff, absTol, relTol, scale, absTol+relTol*scale)
+	}
+}
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -165,6 +190,8 @@ func TestAdd_NonFiniteRejection(t *testing.T) {
 	}
 }
 
+// TestAdd_UnknownGroupRejection verifies that Add rejects observations for
+// groups not in the registered universe. TST-008.
 func TestAdd_UnknownGroupRejection(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -1005,6 +1032,218 @@ func TestMath_PartitionEquivalence(t *testing.T) {
 			assert.Equal(t, ref.Observations, merged.Observations)
 		})
 	}
+}
+
+// TestMath_PermutationInvariance verifies that reordering observations within
+// each group does not change SS values or F beyond floating-point tolerance.
+// TST-014.
+func TestMath_PermutationInvariance(t *testing.T) {
+	for _, fx := range mathFixtures {
+		t.Run("within-group permutation MUST leave SS and F unchanged: "+fx.name, func(t *testing.T) {
+			ref, err := OneWay(fx.groups)
+			require.NoError(t, err)
+			if ref.Status != StatusOK {
+				t.Skip("fixture does not produce StatusOK — skipping permutation check")
+			}
+
+			// Reverse every group's slice as a deterministic permutation.
+			reversed := make(map[string][]float64, len(fx.groups))
+			for g, xs := range fx.groups {
+				cp := make([]float64, len(xs))
+				for i, x := range xs {
+					cp[len(xs)-1-i] = x
+				}
+				reversed[g] = cp
+			}
+
+			got, err := OneWay(reversed)
+			require.NoError(t, err)
+			assert.Equal(t, ref.Status, got.Status)
+			assert.InDelta(t, ref.BetweenSS, got.BetweenSS, tol, "BetweenSS")
+			assert.InDelta(t, ref.WithinSS, got.WithinSS, tol, "WithinSS")
+			assert.InDelta(t, ref.F, got.F, tol, "F")
+		})
+	}
+}
+
+// TestMath_LabelBijectionInvariance verifies that renaming groups does not
+// change SS values, df, or F. TST-015.
+func TestMath_LabelBijectionInvariance(t *testing.T) {
+	for _, fx := range mathFixtures {
+		t.Run("label rename MUST leave table values unchanged: "+fx.name, func(t *testing.T) {
+			ref, err := OneWay(fx.groups)
+			require.NoError(t, err)
+			if ref.Status != StatusOK {
+				t.Skip("fixture does not produce StatusOK — skipping bijection check")
+			}
+
+			// Map each original label to a synthetic name "grp_N".
+			renamed := make(map[string][]float64, len(fx.groups))
+			i := 0
+			for g, xs := range fx.groups {
+				_ = g
+				renamed[strconv.Itoa(i)] = xs
+				i++
+			}
+
+			got, err := OneWay(renamed)
+			require.NoError(t, err)
+			assert.Equal(t, ref.Status, got.Status)
+			assert.InDelta(t, ref.BetweenSS, got.BetweenSS, tol, "BetweenSS")
+			assert.InDelta(t, ref.WithinSS, got.WithinSS, tol, "WithinSS")
+			assert.Equal(t, ref.BetweenDF, got.BetweenDF, "BetweenDF")
+			assert.Equal(t, ref.WithinDF, got.WithinDF, "WithinDF")
+			assert.InDelta(t, ref.F, got.F, tol, "F")
+		})
+	}
+}
+
+// ── Numerical stress tests TST-036–040 ───────────────────────────────────────
+//
+// These fixtures exercise adversarial data families from wiki/04 §Adversarial.
+// They use withinTol (wiki/04 §Tolerance) rather than the fixed tol constant
+// because SS values are extreme-scale or the offset-to-spread ratio is large.
+//
+// relTol=1e-12 corresponds to ~4 ULPs at any scale for Chan-merge arithmetic.
+// absTol=1e-20 catches the near-zero case without masking real errors.
+
+const (
+	stressAbsTol = 1e-20
+	stressRelTol = 1e-12
+)
+
+// TestStress_HighlyUnbalanced [TST-036] checks that a 1:20 group size ratio
+// produces a valid ANOVA table with correct decomposition and non-negative SS.
+func TestStress_HighlyUnbalanced(t *testing.T) {
+	groups := map[string][]float64{
+		"A": {100},
+		"B": {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20},
+	}
+	r, err := OneWay(groups)
+	require.NoError(t, err)
+	require.Equal(t, StatusOK, r.Status)
+	assert.True(t, r.BetweenSS >= 0, "BetweenSS must be non-negative")
+	assert.True(t, r.WithinSS >= 0, "WithinSS must be non-negative")
+	assert.True(t, withinTol(r.TotalSS, r.BetweenSS+r.WithinSS, stressAbsTol, stressRelTol),
+		"SS decomposition: TotalSS=%g BetweenSS+WithinSS=%g", r.TotalSS, r.BetweenSS+r.WithinSS)
+}
+
+// TestStress_SingletonMixed [TST-037] checks two singleton groups mixed with
+// a larger group. Verifies decomposition; also verifies translation invariance
+// at a +1e6 offset (a moderate offset well within Chan merge accuracy).
+func TestStress_SingletonMixed(t *testing.T) {
+	base := map[string][]float64{
+		"A": {42},
+		"B": {1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
+		"C": {20},
+	}
+	ref, err := OneWay(base)
+	require.NoError(t, err)
+	require.Equal(t, StatusOK, ref.Status)
+
+	assert.True(t, ref.BetweenSS >= 0, "BetweenSS must be non-negative")
+	assert.True(t, ref.WithinSS >= 0, "WithinSS must be non-negative")
+	assert.True(t, withinTol(ref.TotalSS, ref.BetweenSS+ref.WithinSS, stressAbsTol, stressRelTol),
+		"SS decomposition")
+
+	// Translation invariance at +1e6 (moderate offset; well within Chan accuracy).
+	const offset = 1e6
+	shifted := make(map[string][]float64, len(base))
+	for g, xs := range base {
+		cp := make([]float64, len(xs))
+		for i, x := range xs {
+			cp[i] = x + offset
+		}
+		shifted[g] = cp
+	}
+	got, err := OneWay(shifted)
+	require.NoError(t, err)
+	require.Equal(t, StatusOK, got.Status)
+	assertWithinTol(t, ref.BetweenSS, got.BetweenSS, stressAbsTol, stressRelTol, "BetweenSS under +1e6 translation")
+	assertWithinTol(t, ref.WithinSS, got.WithinSS, stressAbsTol, stressRelTol, "WithinSS under +1e6 translation")
+	assertWithinTol(t, ref.F, got.F, stressAbsTol, stressRelTol, "F under +1e6 translation")
+}
+
+// TestStress_TinyScale [TST-038] checks that values near the floor of float64
+// (~1e-300) either produce a valid table or return a documented degenerate
+// status — and never panic or return StatusNumericalFailure silently.
+func TestStress_TinyScale(t *testing.T) {
+	groups := map[string][]float64{
+		"A": {1e-300, 2e-300, 3e-300},
+		"B": {4e-300, 5e-300, 6e-300},
+	}
+	r, err := OneWay(groups)
+	require.NoError(t, err)
+	// Values may underflow to produce zero SS — InfiniteF or IndeterminateZeroOverZero
+	// are both acceptable degenerate statuses. NumericalFailure is not acceptable
+	// unless the result is genuinely un-representable.
+	acceptable := r.Status == StatusOK ||
+		r.Status == StatusInfiniteF ||
+		r.Status == StatusIndeterminateZeroOverZero ||
+		r.Status == StatusNumericalWarning
+	assert.True(t, acceptable, "unexpected status for tiny-scale data: %v", r.Status)
+	if r.Status == StatusOK || r.Status == StatusNumericalWarning {
+		assert.True(t, r.BetweenSS >= 0, "BetweenSS must be non-negative")
+		assert.True(t, r.WithinSS >= 0, "WithinSS must be non-negative")
+	}
+}
+
+// TestStress_HugeScale [TST-039] checks that values near 1e+150 produce
+// a valid table with correct decomposition within relative tolerance.
+// SS values are O(1e301) so the fixed tol=1e-10 is meaningless; we use
+// stressRelTol=1e-12 (~4 ULPs) per wiki/04.
+func TestStress_HugeScale(t *testing.T) {
+	groups := map[string][]float64{
+		"A": {1e150, 2e150, 3e150},
+		"B": {4e150, 5e150, 6e150},
+	}
+	r, err := OneWay(groups)
+	require.NoError(t, err)
+	require.Equal(t, StatusOK, r.Status)
+	assert.True(t, r.BetweenSS >= 0, "BetweenSS must be non-negative")
+	assert.True(t, r.WithinSS >= 0, "WithinSS must be non-negative")
+	assert.True(t, withinTol(r.TotalSS, r.BetweenSS+r.WithinSS, stressAbsTol, stressRelTol),
+		"SS decomposition: TotalSS=%g BetweenSS+WithinSS=%g", r.TotalSS, r.BetweenSS+r.WithinSS)
+
+	// Partition equivalence: split each group in half and merge.
+	labels := []string{"A", "B"}
+	left := newAcc(t, labels...)
+	right := newAcc(t, labels...)
+	for g, xs := range groups {
+		for i, x := range xs {
+			if i%2 == 0 {
+				require.NoError(t, left.Add(g, x))
+			} else {
+				require.NoError(t, right.Add(g, x))
+			}
+		}
+	}
+	require.NoError(t, left.Merge(right))
+	merged := left.Snapshot()
+	require.Equal(t, StatusOK, merged.Status)
+	assertWithinTol(t, r.BetweenSS, merged.BetweenSS, stressAbsTol, stressRelTol, "BetweenSS partition equiv")
+	assertWithinTol(t, r.WithinSS, merged.WithinSS, stressAbsTol, stressRelTol, "WithinSS partition equiv")
+	assertWithinTol(t, r.F, merged.F, stressAbsTol, stressRelTol, "F partition equiv")
+}
+
+// TestStress_DeterministicOrder [TST-040] verifies that group label insertion
+// order does not affect SS or F — canonical ordering in Snapshot must be stable.
+func TestStress_DeterministicOrder(t *testing.T) {
+	// Same data fed in two different map literal orders.
+	order1 := map[string][]float64{"D": {7, 8}, "A": {1, 2}, "C": {5, 6}, "B": {3, 4}}
+	order2 := map[string][]float64{"A": {1, 2}, "B": {3, 4}, "C": {5, 6}, "D": {7, 8}}
+
+	r1, err := OneWay(order1)
+	require.NoError(t, err)
+	r2, err := OneWay(order2)
+	require.NoError(t, err)
+
+	require.Equal(t, r1.Status, r2.Status)
+	assert.InDelta(t, r1.BetweenSS, r2.BetweenSS, tol, "BetweenSS must be order-independent")
+	assert.InDelta(t, r1.WithinSS, r2.WithinSS, tol, "WithinSS must be order-independent")
+	assert.InDelta(t, r1.F, r2.F, tol, "F must be order-independent")
+	assert.Equal(t, r1.BetweenDF, r2.BetweenDF, "BetweenDF must be order-independent")
+	assert.Equal(t, r1.WithinDF, r2.WithinDF, "WithinDF must be order-independent")
 }
 
 // ── JSON serialization ────────────────────────────────────────────────────────

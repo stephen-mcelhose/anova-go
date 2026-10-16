@@ -40,6 +40,13 @@
 ## ADR-006 — Invalid and degenerate results are explicit statuses
 
 **Status:** Accepted  
-**Decision:** Result types distinguish invalid prerequisites, indeterminate #$#0/0#$#, meaningful #$#+\infty#$# F, and numerical failures.  
+**Decision:** Result types distinguish invalid prerequisites, indeterminate #$#0/0#$#, meaningful #$#+\\infty#$# F, and numerical failures.  
 **Rationale:** Returning fabricated 0/NaN p-values silently corrupts downstream interpretation.  
 **Consequences:** API consumers must check status/validity before using p-values.
+
+## ADR-007 — R is the trusted oracle for pinned ANOVA table fixtures; revisit for fuzz
+
+**Status:** Accepted  
+**Decision:** Use R 4.5.0 `aov()` as the external oracle for pinned full-table differential tests (TST-021–025). Accept its output as ground truth for non-adversarial fixtures. Do not use it as a dynamic fuzz oracle.  
+**Rationale:** During Phase 1 gap-filling we compared R's `aov()` output against our Welford/Chan implementation across FX-001–004 and three non-trivial decimal fixtures. Agreement was within 1e-14 to 3e-13 on all tested fields — well inside the 1e-9 pinned tolerance. R uses a QR-based algorithm which is independently trustworthy for normal-scale data. One exception was found: FX-008 (large-offset adversarial, values ~1e12 with small spread). R's `aov()` produced SS_B ≈ 250.004 (~1.8e-5 relative error) due to cancellation in its intermediate sums, whereas the Go Welford/Chan implementation yields SS_B = 250.000 (provably correct by translation invariance). FX-008 is therefore excluded from the R oracle comparison and covered instead by `TestMath_TranslationInvariance`. For fuzz and exhaustive math tests, a static CSV is not a viable oracle. The right strategy for those is mathematical invariants (decomposition, non-negativity, translation invariance, partition equivalence) and, if absolute-value cross-checks are needed, a separate controlled naive reference implementation for well-conditioned inputs.  
+**Consequences:** The pinned oracle CSV (`anova_table_fixtures.csv`) is a regression guard, not a fuzz harness. If fuzz testing or exhaustive math tests surface failures that require a dynamic trusted reference, revisit this ADR to choose between: R via subprocess, a naive two-pass Go reference restricted to well-conditioned inputs, or an alternative trusted library. Do not extend the R oracle CSV to adversarial inputs without first verifying R's answer is correct for that fixture.

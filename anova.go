@@ -109,9 +109,9 @@ type GroupSummary struct {
 	M2    float64 `json:"m2"`
 }
 
-// Result is an immutable ANOVA snapshot. P is unavailable (NaN) in this
-// implementation pending validated F-tail support. Check Status before using
-// F or other inferential fields.
+// Result is an immutable ANOVA snapshot. P is computed for StatusOK via the
+// F-distribution survival function and is NaN for all other statuses. Check
+// Status before using F or other inferential fields.
 //
 // All table fields (BetweenSS through P) are derived from Groups; only Groups
 // needs to be persisted to restore an Accumulator via Load.
@@ -415,8 +415,8 @@ func Load(groups []GroupSummary) (*Accumulator, error) {
 }
 
 // OneWay computes a batch one-way ANOVA from fixed labelled groups. All map
-// entries form the group universe, including empty slices. P is unavailable;
-// see package documentation.
+// entries form the group universe, including empty slices. P is available for
+// StatusOK results; see Result for details.
 func OneWay(groups map[string][]float64) (Result, error) {
 	if len(groups) == 0 {
 		return Result{}, ErrInvalidGroup
